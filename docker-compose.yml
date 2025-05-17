@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  consul:
+    image: consul:1.15
+    command: agent -dev -client=0.0.0.0
+    ports:
+      - "8500:8500"
+    networks:
+      - backend
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/nginx.ctmpl:/etc/consul-templates/nginx.ctmpl
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/templates:/etc/nginx/templates
+    depends_on:
+      - consul
+    ports:
+      - "8080:80"
+    networks:
+      - backend
+
+  consul-template:
+    image: hashicorp/consul-template:latest
+    volumes:
+      - ./nginx/nginx.ctmpl:/etc/consul-templates/nginx.ctmpl
+      - ./nginx/templates:/etc/nginx/templates
+    command: >
+      -consul-addr=consul:8500
+      -template="/etc/consul-templates/nginx.ctmpl:/etc/nginx/templates/upstream.conf:nginx -s reload"
+    depends_on:
+      - nginx
+    networks:
+      - backend
+
+  app:
+    image: hashicorp/http-echo
+    command: ["-text=hello from app"]
+    networks:
+      - backend
+    ports:
+      - "9000:5678"
+    labels:
+      - "SERVICE_NAME=myapp"
+    entrypoint: >
+      sh -c 'sleep 3 && curl -X PUT --data "{{\"Name\":\"myapp\",\"Address\":\"app\",\"Port\":5678}}" http://consul:8500/v1/agent/service/register && http-echo -text="hello from app"'
+
+networks:
+  backend:
+    driver: bridge
