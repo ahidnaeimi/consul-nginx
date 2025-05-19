@@ -1,13 +1,39 @@
-upstream backend {
-  {{ range service "myapp" }}
-  server {{ .Address }}:{{ .Port }};
-  {{ end }}
-}
+{{- range services }}
+  {{- $svc := service .Name }}
+  upstream {{ .Name }} {
+    {{- range $svc }}
+    server {{ .Address }}:{{ .Port }};
+    {{- else }}
+    server 127.0.0.1:65535;
+    {{- end }}
+  }
+{{- end }}
 
+{{- range services }}
+  {{- $svc := service .Name }}
+  {{- range $i, $inst := $svc }}
+    {{- $host := "" }}
+    {{- range $inst.Tags }}
+      {{- $tagStr := printf "%s" . }}
+      {{- if ge (len $tagStr) 13 }}
+        {{- if eq (slice $tagStr 0 13) "virtual_host=" }}
+          {{- $host = (slice $tagStr 13) }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+
+    {{- if ne $host "" }}
 server {
   listen 80;
+  server_name {{ $host }};
 
   location / {
-    proxy_pass http://backend;
+    proxy_pass http://{{ $inst.Name }};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
   }
 }
+    {{- end }}
+  {{- end }}
+{{- end }}

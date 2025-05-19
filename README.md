@@ -20,3 +20,17 @@
 
 ```bash
 docker-compose up -d
+```
+
+## اضافه کردن سرویس جدید به صورت داینامیک
+
+برای اضافه کردن یک سرویس جدید به صورت دستی و ثبت خودکار آن در Consul، می‌توانید از دستور زیر استفاده کنید:
+
+```bash
+docker run -d \
+  --name myapp \
+  --label "SERVICE_NAME=myapp" \
+  --env "SERVICE_TAGS=virtual_host=myapp.local" \
+  --network {compose_network} \
+  --expose 8000 \
+  crccheck/hello-world

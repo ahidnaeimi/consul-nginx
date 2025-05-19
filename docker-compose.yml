@@ -7,7 +7,7 @@ networks:
 services:
 
   consul:
-    image: consul:latest
+    image: docker.repoifb.local/hashicorp/consul:latest
     container_name: consul
     command: agent -dev -client=0.0.0.0
     ports:
@@ -16,7 +16,7 @@ services:
       - mynet
 
   registrator:
-    image: gliderlabs/registrator:latest
+    image: docker.repoifb.local/gliderlabs/registrator:latest
     container_name: registrator
     command: -internal consul://consul:8500
     volumes:
@@ -27,11 +27,11 @@ services:
       - mynet
 
   nginx:
-    image: nginx:latest
+    image: docker.repoifb.local/nginx:latest
     container_name: nginx
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/templates/upstream.ctmpl:/etc/nginx/templates/upstream.ctmpl:ro
+      - ./shared-nginx-templates:/etc/nginx/templates
     ports:
       - "80:80"
     depends_on:
@@ -40,10 +40,31 @@ services:
     networks:
       - mynet
 
-  myapp:
-    image: yourappimage:latest
-    container_name: myapp
+  # myapp:
+  #   image: docker.repoifb.local/crccheck/hello-world
+  #   container_name: myapp
+  #   networks:
+  #     - mynet
+  #   expose:
+  #     - "8000"
+  #   environment:
+  #     - SERVICE_TAGS=virtual_host=myapp.local
+  #   labels:
+  #     - "SERVICE_NAME=myapp"
+
+  consul-template:
+    image: docker.repoifb.local/hashicorp/consul-template:latest
+    container_name: consul-template
+    command: >
+      -consul-addr=consul:8500
+      -template="/etc/consul-template/upstream.ctmpl:/etc/nginx/templates/upstream.conf"
+    volumes:
+      - ./nginx/templates/upstream.ctmpl:/etc/consul-template/upstream.ctmpl:ro
+      - ./shared-nginx-templates:/etc/nginx/templates
+      - /var/run/docker.sock:/tmp/docker.sock
+    depends_on:
+      - nginx
+      - consul
+      # - myapp
     networks:
       - mynet
-    # بدون expose پورت به بیرون
-    # فرض می‌کنیم سرویس روی 8080 در کانتینر اجرا می‌شود
