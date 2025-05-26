@@ -6,25 +6,42 @@ networks:
 
 services:
 
+  # echo "YOUR_ACL_TOKEN" | docker secret create consul_token -
   consul:
     image: docker.repoifb.local/hashicorp/consul:latest
     container_name: consul
-    command: agent -dev -client=0.0.0.0
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0 -datacenter=dc1 -node=server1 -bind=0.0.0.0 -config-dir=/consul/config
     ports:
       - "8500:8500"
+    volumes:
+      - ./consul/config:/consul/config
     networks:
       - mynet
 
-  registrator:
-    image: docker.repoifb.local/gliderlabs/registrator:latest
-    container_name: registrator
-    command: -internal consul://consul:8500
-    volumes:
-      - /var/run/docker.sock:/tmp/docker.sock
-    depends_on:
-      - consul
-    networks:
-      - mynet
+  # registrator:
+  #   image: docker.repoifb.local/pjhampton/registrator:latest
+  #   container_name: registrator
+  #   command: -internal -auth=ef86beb3-2e43-469f-6637-1762bf7e269f consul://consul:8500
+  #   volumes:
+  #     - /var/run/docker.sock:/tmp/docker.sock
+  #   depends_on:
+  #     - consul
+  #   networks:
+  #     - mynet
+
+  # conship:
+  #   build: ./conship
+  #   container_name: conship
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   environment:
+  #     - CONSUL_HTTP_ADDR=http://consul:8500
+  #     - CONSUL_HTTP_TOKEN=eb5a4d02-c47b-014c-d2b0-8cc0a52fdc79
+  #   networks:
+  #     - mynet
+  #   depends_on:
+  #     - consul
+
 
   nginx:
     image: docker.repoifb.local/nginx:latest
@@ -36,7 +53,8 @@ services:
       - "80:80"
     depends_on:
       - consul
-      - registrator
+      # - conship
+      #- registrator
     networks:
       - mynet
 
@@ -55,11 +73,10 @@ services:
   consul-template:
     image: docker.repoifb.local/hashicorp/consul-template:latest
     container_name: consul-template
-    command: >
-      -consul-addr=consul:8500
-      -template="/etc/consul-template/upstream.ctmpl:/etc/nginx/templates/upstream.conf"
+    command: -config=/etc/consul-template/config.hcl
     volumes:
       - ./nginx/templates/upstream.ctmpl:/etc/consul-template/upstream.ctmpl:ro
+      - ./consul-template/config.hcl:/etc/consul-template/config.hcl:ro
       - ./shared-nginx-templates:/etc/nginx/templates
       - /var/run/docker.sock:/tmp/docker.sock
     depends_on:
