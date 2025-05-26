@@ -29,7 +29,7 @@ func getEnv(key, fallback string) string {
 
 var (
 	consulAddress   = getEnv("CONSUL_HTTP_ADDR", "http://localhost:8500")
-	consulToken     = getEnv("CONSUL_HTTP_TOKEN", "80dc8fb6-b34e-1db9-24b7-a1c663ce252b")
+	consulToken     = getEnv("CONSUL_HTTP_TOKEN", "2bf434d2-2856-c6bd-b122-e4e060ae1ef8")
 	registeredPorts = make(map[string][]int)
 	stateFile       = "registered.json"
 	mu              sync.Mutex
@@ -59,10 +59,11 @@ func main() {
 			log.Fatalf("Error from Docker events: %v", err)
 		case msg := <-messages:
 			if msg.Type == events.ContainerEventType {
+				log.Println("msg.Action: %s", msg.Action)
 				switch msg.Action {
 				case "start":
 					go handleContainerStart(cli, msg.ID)
-				case "die", "stop", "destroy", "remove":
+				case "destroy":
 					go handleContainerStop(msg.ID)
 				}
 			}
@@ -178,8 +179,10 @@ func handleContainerStart(cli *client.Client, containerID string) {
 		}
 	}
 
+	shortID := containerID[:12]
+
 	mu.Lock()
-	registeredPorts[containerID] = ports
+	registeredPorts[shortID] = ports
 	mu.Unlock()
 	saveState()
 }
@@ -246,21 +249,22 @@ func handleContainerStart(cli *client.Client, containerID string) {
 // }
 
 func handleContainerStop(containerID string) {
+	shortID := containerID[:12]
 	mu.Lock()
-	ports, ok := registeredPorts[containerID]
+	ports, ok := registeredPorts[shortID]
 	mu.Unlock()
 	if !ok {
-		log.Printf("No registered ports found for container %s", containerID)
+		log.Printf("No registered ports found for container %s", shortID)
 		return
 	}
 
 	for _, port := range ports {
 		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
 
-		// مرحله ۱: حذف از عامل
+		// مرحله 1: حذف از Agent
 		req, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/agent/service/deregister/%s", consulAddress, serviceID), nil)
 		if err != nil {
-			log.Printf("Failed to create deregister request for %s: %v", serviceID, err)
+			log.Printf("Failed to create agent deregister request for %s: %v", serviceID, err)
 			continue
 		}
 		if consulToken != "" {
@@ -268,18 +272,18 @@ func handleContainerStop(containerID string) {
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to deregister %s: %v", serviceID, err)
-			continue
+			log.Printf("Failed to deregister %s from agent: %v", serviceID, err)
+		} else {
+			resp.Body.Close()
+			log.Printf("Deregistered service %s from agent (status %d)", serviceID, resp.StatusCode)
 		}
-		resp.Body.Close()
-		log.Printf("Deregistered service %s from agent (status %d)", serviceID, resp.StatusCode)
 
-		// مرحله ۲: حذف از کاتالوگ
+		// مرحله 2: حذف از Catalog
 		// ابتدا اطلاعات سرویس را از کاتالوگ دریافت می‌کنیم
 		catalogURL := fmt.Sprintf("%s/v1/catalog/service/%s", consulAddress, serviceID)
 		catalogReq, err := http.NewRequest("GET", catalogURL, nil)
 		if err != nil {
-			log.Printf("Failed to create catalog request for %s: %v", serviceID, err)
+			log.Printf("Failed to create catalog lookup request for %s: %v", serviceID, err)
 			continue
 		}
 		if consulToken != "" {
@@ -287,14 +291,16 @@ func handleContainerStop(containerID string) {
 		}
 		catalogResp, err := http.DefaultClient.Do(catalogReq)
 		if err != nil {
-			log.Printf("Failed to get catalog info for %s: %v", serviceID, err)
+			log.Printf("Failed to lookup service %s in catalog: %v", serviceID, err)
 			continue
 		}
 		defer catalogResp.Body.Close()
+
 		if catalogResp.StatusCode != http.StatusOK {
-			log.Printf("Failed to get catalog info for %s: status %d", serviceID, catalogResp.StatusCode)
+			log.Printf("Service %s not found in catalog (status %d)", serviceID, catalogResp.StatusCode)
 			continue
 		}
+
 		var catalogEntries []struct {
 			Node       string `json:"Node"`
 			Datacenter string `json:"Datacenter"`
@@ -304,38 +310,41 @@ func handleContainerStop(containerID string) {
 			log.Printf("Failed to decode catalog response for %s: %v", serviceID, err)
 			continue
 		}
+
 		for _, entry := range catalogEntries {
-			deregisterPayload := map[string]interface{}{
+			deregisterPayload := map[string]string{
 				"Node":       entry.Node,
-				"ServiceID":  entry.ServiceID,
 				"Datacenter": entry.Datacenter,
+				"ServiceID":  entry.ServiceID,
 			}
 			payloadBytes, err := json.Marshal(deregisterPayload)
 			if err != nil {
-				log.Printf("Failed to marshal deregister payload for %s: %v", serviceID, err)
+				log.Printf("Failed to marshal catalog deregister payload for %s: %v", serviceID, err)
 				continue
 			}
-			deregisterReq, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/catalog/deregister", consulAddress), strings.NewReader(string(payloadBytes)))
+
+			catalogDeregisterReq, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/catalog/deregister", consulAddress), strings.NewReader(string(payloadBytes)))
 			if err != nil {
 				log.Printf("Failed to create catalog deregister request for %s: %v", serviceID, err)
 				continue
 			}
 			if consulToken != "" {
-				deregisterReq.Header.Set("X-Consul-Token", consulToken)
+				catalogDeregisterReq.Header.Set("X-Consul-Token", consulToken)
 			}
-			deregisterReq.Header.Set("Content-Type", "application/json")
-			deregisterResp, err := http.DefaultClient.Do(deregisterReq)
+			catalogDeregisterReq.Header.Set("Content-Type", "application/json")
+
+			catalogDeregisterResp, err := http.DefaultClient.Do(catalogDeregisterReq)
 			if err != nil {
 				log.Printf("Failed to deregister %s from catalog: %v", serviceID, err)
 				continue
 			}
-			deregisterResp.Body.Close()
-			log.Printf("Deregistered service %s from catalog (status %d)", serviceID, deregisterResp.StatusCode)
+			catalogDeregisterResp.Body.Close()
+			log.Printf("Deregistered service %s from catalog (status %d)", serviceID, catalogDeregisterResp.StatusCode)
 		}
 	}
 
 	mu.Lock()
-	delete(registeredPorts, containerID)
+	delete(registeredPorts, shortID)
 	mu.Unlock()
 	saveState()
 }
