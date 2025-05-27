@@ -170,7 +170,33 @@ func handleContainerStart(cli *client.Client, containerID string) {
 		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
 
 		bindings := jsonData.NetworkSettings.Ports[portProto]
+		//tags := []string{"docker"}
+
+		envTags := ""
+		for _, env := range jsonData.Config.Env {
+			if strings.HasPrefix(env, "SERVICE_TAGS=") {
+				envTags = strings.TrimPrefix(env, "SERVICE_TAGS=")
+				break
+			}
+		}
+
 		tags := []string{"docker"}
+		if len(bindings) > 0 {
+			tags = append(tags, "bound")
+		} else {
+			tags = append(tags, "exposed-only")
+		}
+
+		if envTags != "" {
+			for _, tag := range strings.Split(envTags, ",") {
+				trimmed := strings.TrimSpace(tag)
+				if trimmed != "" {
+					tags = append(tags, trimmed)
+				}
+			}
+		}
+
+
 		if len(bindings) > 0 {
 			tags = append(tags, "bound")
 		} else {

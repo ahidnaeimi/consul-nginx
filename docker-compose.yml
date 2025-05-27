@@ -15,6 +15,9 @@ services:
       - "8500:8500"
     volumes:
       - ./consul/config:/consul/config
+    environment:
+      CONSUL_ACL_TOKEN: "ca01e2c4-f6c1-d582-6ba3-fc5f63208ded" # Replace with your actual token
+      CONSUL_LOCAL_CONFIG: '{"acl": {"default_policy": "deny", "enable_token_persistence": true, "tokens": {"master": "ca01e2c4-f6c1-d582-6ba3-fc5f63208ded"}}}'
     networks:
       - mynet
 
@@ -36,7 +39,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - CONSUL_HTTP_ADDR=http://consul:8500
-      - CONSUL_HTTP_TOKEN=29765957-1839-759e-8ed5-e44de35fcc2e
+      - CONSUL_HTTP_TOKEN=ca01e2c4-f6c1-d582-6ba3-fc5f63208ded
     networks:
       - mynet
     depends_on:
@@ -58,17 +61,17 @@ services:
     networks:
       - mynet
 
-  # myapp:
-  #   image: docker.repoifb.local/crccheck/hello-world
-  #   container_name: myapp
-  #   networks:
-  #     - mynet
-  #   expose:
-  #     - "8000"
-  #   environment:
-  #     - SERVICE_TAGS=virtual_host=myapp.local
-  #   labels:
-  #     - "SERVICE_NAME=myapp"
+  myapp:
+    image: docker.repoifb.local/crccheck/hello-world
+    container_name: myapp
+    networks:
+      - mynet
+    expose:
+      - "8000"
+    environment:
+      - SERVICE_TAGS=virtual_host=myapp.local
+    labels:
+      - "SERVICE_NAME=myapp"
 
   consul-template:
     image: docker.repoifb.local/hashicorp/consul-template:latest

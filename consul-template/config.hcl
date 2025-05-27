@@ -1,6 +1,6 @@
 consul {
   address = "consul:8500"
-  token   = "29765957-1839-759e-8ed5-e44de35fcc2e"
+  token   = "ca01e2c4-f6c1-d582-6ba3-fc5f63208ded"
 }
 
 template {
