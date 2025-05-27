@@ -1,4 +1,3 @@
-// فایل کامل main.go
 package main
 
 import (
@@ -28,14 +27,55 @@ func getEnv(key, fallback string) string {
 }
 
 var (
-	consulAddress   = getEnv("CONSUL_HTTP_ADDR", "http://localhost:8500")
-	consulToken     = getEnv("CONSUL_HTTP_TOKEN", "29765957-1839-759e-8ed5-e44de35fcc2e")
-	registeredPorts = make(map[string][]int)
-	stateFile       = "registered.json"
-	mu              sync.Mutex
+	consulAddress        = getEnv("CONSUL_HTTP_ADDR", "http://localhost:8500")
+	consulToken          = getEnv("CONSUL_HTTP_TOKEN", "29765957-1839-759e-8ed5-e44de35fcc2e")
+	registeredContainers = make(map[string]ContainerInfo)
+	stateFile            = "registered.json"
+	mu                   sync.Mutex
+	containerName        string = "conship"
 )
 
+type ContainerInfo struct {
+	Ports       []int  `json:"ports"`
+	ServiceName string `json:"serviceName"`
+}
+
+func initContainerName() error {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return err
+	}
+
+	idPrefix := hostname
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+
+	containers, err := cli.ContainerList(context.Background(), container.ListOptions{All: true})
+	if err != nil {
+		return err
+	}
+
+	for _, container := range containers {
+		if strings.HasPrefix(container.ID, idPrefix) {
+			containerName = strings.TrimPrefix(container.Names[0], "/")
+			return nil
+		}
+	}
+
+	return fmt.Errorf("container not found with ID prefix: %s", idPrefix)
+}
+
 func main() {
+	err := initContainerName()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	fmt.Println("Container Name:", containerName)
+
 	loadState()
 
 	ctx := context.Background()
@@ -59,7 +99,6 @@ func main() {
 			log.Fatalf("Error from Docker events: %v", err)
 		case msg := <-messages:
 			if msg.Type == events.ContainerEventType {
-				//log.Println("msg.Action: %s", msg.Action)
 				switch msg.Action {
 				case "start":
 					go handleContainerStart(cli, msg.ID)
@@ -74,12 +113,13 @@ func main() {
 func handleContainerStart(cli *client.Client, containerID string) {
 	ctx := context.Background()
 
-	conshipIP := ""
-	conshipContainer, err := findContainerByName(cli, ctx, "nginx")
+	conshipContainer, err := findContainerByName(cli, ctx, containerName)
 	if err != nil {
 		log.Printf("Failed to find conship container: %v", err)
 		return
 	}
+
+	conshipIP := ""
 	for _, net := range conshipContainer.NetworkSettings.Networks {
 		if net.IPAddress != "" {
 			conshipIP = net.IPAddress
@@ -105,6 +145,9 @@ func handleContainerStart(cli *client.Client, containerID string) {
 				sharedNet = name
 				break
 			}
+		}
+		if sharedNet != "" {
+			break
 		}
 	}
 	if sharedNet == "" {
@@ -174,94 +217,37 @@ func handleContainerStart(cli *client.Client, containerID string) {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Printf("Service %s on port %d registered successfully in Consul", containerName, port)
 		} else {
-			body, _ := io.ReadAll(resp.Body)
-			log.Printf("Failed to register service %s, status: %d, body: %s", containerName, resp.StatusCode, string(body))
+			log.Printf("Failed to register service %s on port %d, status: %d", containerName, port, resp.StatusCode)
 		}
 	}
 
 	shortID := containerID[:12]
 
 	mu.Lock()
-	registeredPorts[shortID] = ports
+	registeredContainers[shortID] = ContainerInfo{
+		Ports:       ports,
+		ServiceName: containerName,
+	}
 	mu.Unlock()
 	saveState()
 }
 
-// func handleContainerStop(containerID string) {
-// 	mu.Lock()
-// 	ports, ok := registeredPorts[containerID]
-// 	mu.Unlock()
-// 	if !ok {
-// 		log.Printf("No registered ports found for container %s", containerID)
-// 		return
-// 	}
-
-// 	for _, port := range ports {
-// 		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
-// 		deregisterServiceFromCatalog(serviceID)
-// 	}
-
-// 	mu.Lock()
-// 	delete(registeredPorts, containerID)
-// 	mu.Unlock()
-// 	saveState()
-// }
-
-// func deregisterServiceFromCatalog(serviceID string) {
-// 	resp, err := http.Get(fmt.Sprintf("%s/v1/catalog/nodes", consulAddress))
-// 	if err != nil {
-// 		log.Printf("Failed to get nodes: %v", err)
-// 		return
-// 	}
-// 	defer resp.Body.Close()
-
-// 	var nodes []struct {
-// 		Node string `json:"Node"`
-// 	}
-// 	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
-// 		log.Printf("Failed to decode nodes: %v", err)
-// 		return
-// 	}
-
-// 	for _, node := range nodes {
-// 		payload := map[string]interface{}{
-// 			"Node": node.Node,
-// 			"Service": map[string]string{
-// 				"ID": serviceID,
-// 			},
-// 		}
-// 		body, _ := json.Marshal(payload)
-
-// 		req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/v1/catalog/deregister", consulAddress), strings.NewReader(string(body)))
-// 		if consulToken != "" {
-// 			req.Header.Set("X-Consul-Token", consulToken)
-// 		}
-// 		req.Header.Set("Content-Type", "application/json")
-
-// 		resp, err := http.DefaultClient.Do(req)
-// 		if err != nil {
-// 			log.Printf("Failed to deregister service %s from node %s: %v", serviceID, node.Node, err)
-// 			continue
-// 		}
-// 		resp.Body.Close()
-// 		log.Printf("Sent deregister request for service %s to node %s", serviceID, node.Node)
-// 	}
-// }
-
 func handleContainerStop(containerID string) {
 	shortID := containerID[:12]
+
 	mu.Lock()
-	ports, ok := registeredPorts[shortID]
+	info, ok := registeredContainers[shortID]
 	mu.Unlock()
+
 	if !ok {
-		log.Printf("No registered ports found for container %s", shortID)
+		log.Printf("No registered info found for container %s", shortID)
 		return
 	}
 
-	for _, port := range ports {
-		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
+	for _, port := range info.Ports {
+		serviceID := fmt.Sprintf("%s-%d", shortID, port)
 
-		// مرحله 1: حذف از Agent
+		// حذف از Agent
 		req, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/agent/service/deregister/%s", consulAddress, serviceID), nil)
 		if err != nil {
 			log.Printf("Failed to create agent deregister request for %s: %v", serviceID, err)
@@ -278,9 +264,8 @@ func handleContainerStop(containerID string) {
 			log.Printf("Deregistered service %s from agent (status %d)", serviceID, resp.StatusCode)
 		}
 
-		// مرحله 2: حذف از Catalog
-		// ابتدا اطلاعات سرویس را از کاتالوگ دریافت می‌کنیم
-		catalogURL := fmt.Sprintf("%s/v1/catalog/service/%s", consulAddress, serviceID)
+		// حذف از Catalog با استفاده از نام سرویس درست:
+		catalogURL := fmt.Sprintf("%s/v1/catalog/service/%s", consulAddress, info.ServiceName)
 		catalogReq, err := http.NewRequest("GET", catalogURL, nil)
 		if err != nil {
 			log.Printf("Failed to create catalog lookup request for %s: %v", serviceID, err)
@@ -294,7 +279,9 @@ func handleContainerStop(containerID string) {
 			log.Printf("Failed to lookup service %s in catalog: %v", serviceID, err)
 			continue
 		}
-		defer catalogResp.Body.Close()
+
+		bodyBytes, _ := io.ReadAll(catalogResp.Body)
+		catalogResp.Body.Close()
 
 		if catalogResp.StatusCode != http.StatusOK {
 			log.Printf("Service %s not found in catalog (status %d)", serviceID, catalogResp.StatusCode)
@@ -306,9 +293,7 @@ func handleContainerStop(containerID string) {
 			Datacenter string `json:"Datacenter"`
 			ServiceID  string `json:"ServiceID"`
 		}
-		bodyBytes, _ := io.ReadAll(catalogResp.Body)
-		log.Printf("Raw response body for %s: %s", serviceID, string(bodyBytes))
-		if err := json.NewDecoder(catalogResp.Body).Decode(&catalogEntries); err != nil {
+		if err := json.Unmarshal(bodyBytes, &catalogEntries); err != nil {
 			log.Printf("Failed to decode catalog response for %s: %v", serviceID, err)
 			continue
 		}
@@ -346,7 +331,7 @@ func handleContainerStop(containerID string) {
 	}
 
 	mu.Lock()
-	delete(registeredPorts, shortID)
+	delete(registeredContainers, shortID)
 	mu.Unlock()
 	saveState()
 }
@@ -355,7 +340,7 @@ func saveState() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	data, err := json.MarshalIndent(registeredPorts, "", "  ")
+	data, err := json.MarshalIndent(registeredContainers, "", "  ")
 	if err != nil {
 		log.Printf("Failed to marshal state: %v", err)
 		return
@@ -376,7 +361,7 @@ func loadState() {
 		}
 		return
 	}
-	if err := json.Unmarshal(data, &registeredPorts); err != nil {
+	if err := json.Unmarshal(data, &registeredContainers); err != nil {
 		log.Printf("Failed to unmarshal state: %v", err)
 	}
 }

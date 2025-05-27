@@ -29,18 +29,18 @@ services:
   #   networks:
   #     - mynet
 
-  # conship:
-  #   build: ./conship
-  #   container_name: conship
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   environment:
-  #     - CONSUL_HTTP_ADDR=http://consul:8500
-  #     - CONSUL_HTTP_TOKEN=eb5a4d02-c47b-014c-d2b0-8cc0a52fdc79
-  #   networks:
-  #     - mynet
-  #   depends_on:
-  #     - consul
+  conship:
+    build: ./conship
+    container_name: conship
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - CONSUL_HTTP_ADDR=http://consul:8500
+      - CONSUL_HTTP_TOKEN=29765957-1839-759e-8ed5-e44de35fcc2e
+    networks:
+      - mynet
+    depends_on:
+      - consul
 
 
   nginx:
