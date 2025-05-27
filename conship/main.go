@@ -29,7 +29,7 @@ func getEnv(key, fallback string) string {
 
 var (
 	consulAddress   = getEnv("CONSUL_HTTP_ADDR", "http://localhost:8500")
-	consulToken     = getEnv("CONSUL_HTTP_TOKEN", "2bf434d2-2856-c6bd-b122-e4e060ae1ef8")
+	consulToken     = getEnv("CONSUL_HTTP_TOKEN", "29765957-1839-759e-8ed5-e44de35fcc2e")
 	registeredPorts = make(map[string][]int)
 	stateFile       = "registered.json"
 	mu              sync.Mutex
@@ -59,7 +59,7 @@ func main() {
 			log.Fatalf("Error from Docker events: %v", err)
 		case msg := <-messages:
 			if msg.Type == events.ContainerEventType {
-				log.Println("msg.Action: %s", msg.Action)
+				//log.Println("msg.Action: %s", msg.Action)
 				switch msg.Action {
 				case "start":
 					go handleContainerStart(cli, msg.ID)
@@ -306,6 +306,8 @@ func handleContainerStop(containerID string) {
 			Datacenter string `json:"Datacenter"`
 			ServiceID  string `json:"ServiceID"`
 		}
+		bodyBytes, _ := io.ReadAll(catalogResp.Body)
+		log.Printf("Raw response body for %s: %s", serviceID, string(bodyBytes))
 		if err := json.NewDecoder(catalogResp.Body).Decode(&catalogEntries); err != nil {
 			log.Printf("Failed to decode catalog response for %s: %v", serviceID, err)
 			continue
