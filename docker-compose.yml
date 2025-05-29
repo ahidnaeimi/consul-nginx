@@ -4,6 +4,9 @@ networks:
   mynet:
     driver: bridge
 
+volumes:
+  consul_data:
+
 services:
 
   # echo "YOUR_ACL_TOKEN" | docker secret create consul_token -
@@ -15,6 +18,7 @@ services:
       - "8500:8500"
     volumes:
       - ./consul/config:/consul/config
+      - consul_data:/consul/data
     environment:
       CONSUL_ACL_TOKEN: "ca01e2c4-f6c1-d582-6ba3-fc5f63208ded" # Replace with your actual token
       CONSUL_LOCAL_CONFIG: '{"acl": {"default_policy": "deny", "enable_token_persistence": true, "tokens": {"master": "ca01e2c4-f6c1-d582-6ba3-fc5f63208ded"}}}'
@@ -71,7 +75,7 @@ services:
     environment:
       - SERVICE_TAGS=virtual_host=myapp.local
     labels:
-      - "SERVICE_NAME=myapp"
+      - SERVICE_PORTS=8000
 
   consul-template:
     image: docker.repoifb.local/hashicorp/consul-template:latest

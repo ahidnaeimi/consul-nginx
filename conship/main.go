@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -159,17 +160,39 @@ func handleContainerStart(cli *client.Client, containerID string) {
 	serviceAddress := jsonData.NetworkSettings.Networks[sharedNet].IPAddress
 
 	var ports []int
+	var allowedPorts map[int]bool
+
+	// اگر لیبل SERVICE_PORTS وجود داشت، فیلترش کنیم
+	portsLabel, ok := jsonData.Config.Labels["SERVICE_PORTS"]
+	if ok && portsLabel != "" {
+		allowedPorts = make(map[int]bool)
+		for _, part := range strings.Split(portsLabel, ",") {
+			log.Printf("port part: %v", part)
+			p, err := strconv.Atoi(strings.TrimSpace(part))
+			if err != nil {
+				log.Printf("Invalid port in SERVICE_PORTS label: %v", err)
+				continue
+			}
+			allowedPorts[p] = true
+		}
+	}
 	for portProto := range jsonData.NetworkSettings.Ports {
 		port, err := nat.ParsePort(portProto.Port())
 		if err != nil {
 			log.Printf("Invalid port %s for container %s: %v", portProto.Port(), containerName, err)
 			continue
 		}
-		ports = append(ports, port)
 
-		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
+		if allowedPorts != nil && !allowedPorts[port] {
+			continue // در لیبل نیست
+		}
 
 		bindings := jsonData.NetworkSettings.Ports[portProto]
+
+		ports = append(ports, port)
+		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
+
+		//bindings := jsonData.NetworkSettings.Ports[portProto]
 		//tags := []string{"docker"}
 
 		envTags := ""
@@ -195,7 +218,6 @@ func handleContainerStart(cli *client.Client, containerID string) {
 				}
 			}
 		}
-
 
 		if len(bindings) > 0 {
 			tags = append(tags, "bound")
