@@ -29,7 +29,7 @@ func getEnv(key, fallback string) string {
 
 var (
 	consulAddress        = getEnv("CONSUL_HTTP_ADDR", "http://localhost:8500")
-	consulToken          = getEnv("CONSUL_HTTP_TOKEN", "29765957-1839-759e-8ed5-e44de35fcc2e")
+	consulToken          = getEnv("CONSUL_HTTP_TOKEN", "")
 	registeredContainers = make(map[string]ContainerInfo)
 	stateFile            = "registered.json"
 	mu                   sync.Mutex
@@ -85,34 +85,46 @@ func main() {
 		log.Fatalf("Error creating Docker client: %v", err)
 	}
 
-	options := events.ListOptions{
+	eventsCh, errCh := cli.Events(ctx, events.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("type", "container")),
-	}
-	messages, errs := cli.Events(ctx, options)
+	})
 	log.Println("Listening for Docker container events...")
 
 	for {
 		select {
-		case err := <-errs:
+		case event := <-eventsCh:
+			if event.Type == events.ContainerEventType {
+				switch event.Action {
+				case "start":
+					go handleContainerStart(cli, event.ID)
+				case "die", "destroy":
+					go handleContainerStop(cli, event.ID)
+				}
+			}
+		case err := <-errCh:
 			if err == io.EOF {
 				return
 			}
 			log.Fatalf("Error from Docker events: %v", err)
-		case msg := <-messages:
-			if msg.Type == events.ContainerEventType {
-				switch msg.Action {
-				case "start":
-					go handleContainerStart(cli, msg.ID)
-				case "destroy":
-					go handleContainerStop(msg.ID)
-				}
-			}
 		}
 	}
 }
 
 func handleContainerStart(cli *client.Client, containerID string) {
 	ctx := context.Background()
+
+	jsonData, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		log.Printf("Failed to inspect container %s: %v", containerID, err)
+		return
+	}
+
+	// فقط اگر لیبل SERVICE_NAME وجود دارد، ثبت شود
+	svcName, ok := jsonData.Config.Labels["SERVICE_NAME"]
+	if !ok || svcName == "" {
+		log.Printf("SERVICE_NAME label missing for container %s", containerID[:12])
+		return
+	}
 
 	conshipContainer, err := findContainerByName(cli, ctx, containerName)
 	if err != nil {
@@ -127,15 +139,8 @@ func handleContainerStart(cli *client.Client, containerID string) {
 			break
 		}
 	}
-
 	if conshipIP == "" {
 		log.Println("Conship container has no IP")
-		return
-	}
-
-	jsonData, err := cli.ContainerInspect(ctx, containerID)
-	if err != nil {
-		log.Printf("Failed to inspect container %s: %v", containerID, err)
 		return
 	}
 
@@ -162,12 +167,10 @@ func handleContainerStart(cli *client.Client, containerID string) {
 	var ports []int
 	var allowedPorts map[int]bool
 
-	// اگر لیبل SERVICE_PORTS وجود داشت، فیلترش کنیم
 	portsLabel, ok := jsonData.Config.Labels["SERVICE_PORTS"]
 	if ok && portsLabel != "" {
 		allowedPorts = make(map[int]bool)
 		for _, part := range strings.Split(portsLabel, ",") {
-			log.Printf("port part: %v", part)
 			p, err := strconv.Atoi(strings.TrimSpace(part))
 			if err != nil {
 				log.Printf("Invalid port in SERVICE_PORTS label: %v", err)
@@ -176,24 +179,24 @@ func handleContainerStart(cli *client.Client, containerID string) {
 			allowedPorts[p] = true
 		}
 	}
+
 	for portProto := range jsonData.NetworkSettings.Ports {
 		port, err := nat.ParsePort(portProto.Port())
 		if err != nil {
 			log.Printf("Invalid port %s for container %s: %v", portProto.Port(), containerName, err)
 			continue
 		}
-
 		if allowedPorts != nil && !allowedPorts[port] {
-			continue // در لیبل نیست
+			continue
 		}
 
 		bindings := jsonData.NetworkSettings.Ports[portProto]
-
-		ports = append(ports, port)
-		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
-
-		//bindings := jsonData.NetworkSettings.Ports[portProto]
-		//tags := []string{"docker"}
+		tags := []string{"docker"}
+		if len(bindings) > 0 {
+			tags = append(tags, "bound")
+		} else {
+			tags = append(tags, "exposed-only")
+		}
 
 		envTags := ""
 		for _, env := range jsonData.Config.Env {
@@ -202,32 +205,18 @@ func handleContainerStart(cli *client.Client, containerID string) {
 				break
 			}
 		}
-
-		tags := []string{"docker"}
-		if len(bindings) > 0 {
-			tags = append(tags, "bound")
-		} else {
-			tags = append(tags, "exposed-only")
-		}
-
 		if envTags != "" {
 			for _, tag := range strings.Split(envTags, ",") {
-				trimmed := strings.TrimSpace(tag)
-				if trimmed != "" {
+				if trimmed := strings.TrimSpace(tag); trimmed != "" {
 					tags = append(tags, trimmed)
 				}
 			}
 		}
 
-		if len(bindings) > 0 {
-			tags = append(tags, "bound")
-		} else {
-			tags = append(tags, "exposed-only")
-		}
-
+		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
 		serviceDef := map[string]interface{}{
 			"ID":      serviceID,
-			"Name":    containerName,
+			"Name":    svcName,
 			"Address": serviceAddress,
 			"Port":    port,
 			"Tags":    tags,
@@ -238,49 +227,28 @@ func handleContainerStart(cli *client.Client, containerID string) {
 				"DeregisterCriticalServiceAfter": "1m",
 			},
 		}
-
-		payload, err := json.Marshal(serviceDef)
-		if err != nil {
-			log.Printf("Failed to marshal service definition: %v", err)
-			continue
-		}
-
-		req, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/agent/service/register", consulAddress), strings.NewReader(string(payload)))
-		if err != nil {
-			log.Printf("Failed to create request: %v", err)
-			continue
-		}
+		payload, _ := json.Marshal(serviceDef)
+		req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/v1/agent/service/register", consulAddress), strings.NewReader(string(payload)))
 		if consulToken != "" {
 			req.Header.Set("X-Consul-Token", consulToken)
 		}
 		req.Header.Set("Content-Type", "application/json")
-
 		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("Failed to register service in Consul: %v", err)
-			continue
+		if err == nil {
+			resp.Body.Close()
 		}
-		resp.Body.Close()
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			log.Printf("Service %s on port %d registered successfully in Consul", containerName, port)
-		} else {
-			log.Printf("Failed to register service %s on port %d, status: %d", containerName, port, resp.StatusCode)
-		}
+		ports = append(ports, port)
+		log.Printf("Service %s on port %d registered", svcName, port)
 	}
 
 	shortID := containerID[:12]
-
 	mu.Lock()
-	registeredContainers[shortID] = ContainerInfo{
-		Ports:       ports,
-		ServiceName: containerName,
-	}
+	registeredContainers[shortID] = ContainerInfo{Ports: ports, ServiceName: svcName}
 	mu.Unlock()
 	saveState()
 }
 
-func handleContainerStop(containerID string) {
+func handleContainerStop(cli *client.Client, containerID string) {
 	shortID := containerID[:12]
 
 	mu.Lock()
@@ -312,7 +280,23 @@ func handleContainerStop(containerID string) {
 			log.Printf("Deregistered service %s from agent (status %d)", serviceID, resp.StatusCode)
 		}
 
-		// حذف از Catalog با استفاده از نام سرویس درست:
+		// بررسی اینکه آیا سرویس دیگری با همین نام هنوز ثبت شده است یا نه
+		otherStillExists := false
+		mu.Lock()
+		for id, ci := range registeredContainers {
+			if id != shortID && ci.ServiceName == info.ServiceName {
+				otherStillExists = true
+				break
+			}
+		}
+		mu.Unlock()
+
+		if otherStillExists {
+			log.Printf("Another container with same service name (%s) still exists, skipping catalog deregistration for %s", info.ServiceName, serviceID)
+			continue
+		}
+
+		// حذف از Catalog
 		catalogURL := fmt.Sprintf("%s/v1/catalog/service/%s", consulAddress, info.ServiceName)
 		catalogReq, err := http.NewRequest("GET", catalogURL, nil)
 		if err != nil {
@@ -347,6 +331,9 @@ func handleContainerStop(containerID string) {
 		}
 
 		for _, entry := range catalogEntries {
+			if entry.ServiceID != serviceID {
+				continue // فقط سرویسی که مربوط به همین کانتینره حذف شه
+			}
 			deregisterPayload := map[string]string{
 				"Node":       entry.Node,
 				"Datacenter": entry.Datacenter,

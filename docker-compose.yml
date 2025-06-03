@@ -75,6 +75,20 @@ services:
     environment:
       - SERVICE_TAGS=virtual_host=myapp.local
     labels:
+      - SERVICE_NAME=myapp
+      - SERVICE_PORTS=8000
+  
+  myapp2:
+    image: docker.repoifb.local/crccheck/hello-world
+    container_name: myapp2
+    networks:
+      - mynet
+    expose:
+      - "8000"
+    environment:
+      - SERVICE_TAGS=virtual_host=myapp.local
+    labels:
+      - SERVICE_NAME=myapp
       - SERVICE_PORTS=8000
 
   consul-template:
