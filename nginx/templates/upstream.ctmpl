@@ -11,24 +11,20 @@
 
 {{- range services }}
   {{- $svc := service .Name }}
-  {{- range $i, $inst := $svc }}
+  {{- if gt (len $svc) 0 }}
     {{- $host := "" }}
-    {{- range $inst.Tags }}
-      {{- $tagStr := printf "%s" . }}
-      {{- if ge (len $tagStr) 13 }}
-        {{- if eq (slice $tagStr 0 13) "virtual_host=" }}
-          {{- $host = (slice $tagStr 13) }}
-        {{- end }}
+    {{- range (index $svc 0).Tags }}
+      {{- if and (ge (len .) 13) (eq (slice . 0 13) "virtual_host=") }}
+        {{- $host = (slice . 13) }}
       {{- end }}
     {{- end }}
-
     {{- if ne $host "" }}
 server {
   listen 80;
   server_name {{ $host }};
 
   location / {
-    proxy_pass http://{{ $inst.Name }};
+    proxy_pass http://{{ .Name }};
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

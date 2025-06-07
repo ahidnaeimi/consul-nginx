@@ -94,6 +94,7 @@ func main() {
 		select {
 		case event := <-eventsCh:
 			if event.Type == events.ContainerEventType {
+				log.Println("Action: %s", event.Action)
 				switch event.Action {
 				case "start":
 					go handleContainerStart(cli, event.ID)
@@ -278,22 +279,6 @@ func handleContainerStop(cli *client.Client, containerID string) {
 		} else {
 			resp.Body.Close()
 			log.Printf("Deregistered service %s from agent (status %d)", serviceID, resp.StatusCode)
-		}
-
-		// بررسی اینکه آیا سرویس دیگری با همین نام هنوز ثبت شده است یا نه
-		otherStillExists := false
-		mu.Lock()
-		for id, ci := range registeredContainers {
-			if id != shortID && ci.ServiceName == info.ServiceName {
-				otherStillExists = true
-				break
-			}
-		}
-		mu.Unlock()
-
-		if otherStillExists {
-			log.Printf("Another container with same service name (%s) still exists, skipping catalog deregistration for %s", info.ServiceName, serviceID)
-			continue
 		}
 
 		// حذف از Catalog
