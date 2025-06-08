@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -18,6 +19,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 func getEnv(key, fallback string) string {
@@ -28,12 +30,15 @@ func getEnv(key, fallback string) string {
 }
 
 var (
-	consulAddress        = getEnv("CONSUL_HTTP_ADDR", "http://localhost:8500")
-	consulToken          = getEnv("CONSUL_HTTP_TOKEN", "")
-	registeredContainers = make(map[string]ContainerInfo)
-	stateFile            = "registered.json"
-	mu                   sync.Mutex
-	containerName        string = "conship"
+	consulAddress     = getEnv("CONSUL_HTTP_ADDR", "http://localhost:8500")
+	consulToken       = getEnv("CONSUL_HTTP_TOKEN", "")
+	etcdEndpoints     = strings.Split(getEnv("ETCD_ENDPOINTS", "localhost:2379"), ",")
+	registeredCache   = make(map[string]ContainerInfo)
+	mu                sync.Mutex
+	containerName     string = "conship"
+	etcdClient        *clientv3.Client
+	maxVersionsToKeep = 3
+	etcdKeyPrefix     = "conship/"
 )
 
 type ContainerInfo struct {
@@ -70,14 +75,24 @@ func initContainerName() error {
 }
 
 func main() {
-	err := initContainerName()
+	var err error
+	etcdClient, err = clientv3.New(clientv3.Config{
+		Endpoints:   etcdEndpoints,
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("Failed to connect to etcd: %v", err)
+	}
+	defer etcdClient.Close()
+
+	err = initContainerName()
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 	fmt.Println("Container Name:", containerName)
 
-	loadState()
+	loadStateFromEtcd()
 
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -99,7 +114,7 @@ func main() {
 				case "start":
 					go handleContainerStart(cli, event.ID)
 				case "die", "destroy":
-					go handleContainerStop(cli, event.ID)
+					go handleContainerStop(event.ID)
 				}
 			}
 		case err := <-errCh:
@@ -242,18 +257,27 @@ func handleContainerStart(cli *client.Client, containerID string) {
 		log.Printf("Service %s on port %d registered", svcName, port)
 	}
 
+	// shortID := containerID[:12]
+	// mu.Lock()
+	// registeredContainers[shortID] = ContainerInfo{Ports: ports, ServiceName: svcName}
+	// mu.Unlock()
+	// saveState()
 	shortID := containerID[:12]
 	mu.Lock()
-	registeredContainers[shortID] = ContainerInfo{Ports: ports, ServiceName: svcName}
+	registeredCache[shortID] = ContainerInfo{Ports: ports, ServiceName: svcName}
 	mu.Unlock()
-	saveState()
+
+	saveStateToEtcd()
 }
 
-func handleContainerStop(cli *client.Client, containerID string) {
+func handleContainerStop(containerID string) {
 	shortID := containerID[:12]
 
+	// mu.Lock()
+	// info, ok := registeredContainers[shortID]
+	// mu.Unlock()
 	mu.Lock()
-	info, ok := registeredContainers[shortID]
+	info, ok := registeredCache[shortID]
 	mu.Unlock()
 
 	if !ok {
@@ -351,39 +375,10 @@ func handleContainerStop(cli *client.Client, containerID string) {
 	}
 
 	mu.Lock()
-	delete(registeredContainers, shortID)
+	delete(registeredCache, shortID)
 	mu.Unlock()
-	saveState()
-}
 
-func saveState() {
-	mu.Lock()
-	defer mu.Unlock()
-
-	data, err := json.MarshalIndent(registeredContainers, "", "  ")
-	if err != nil {
-		log.Printf("Failed to marshal state: %v", err)
-		return
-	}
-	if err := os.WriteFile(stateFile, data, 0644); err != nil {
-		log.Printf("Failed to write state file: %v", err)
-	}
-}
-
-func loadState() {
-	mu.Lock()
-	defer mu.Unlock()
-
-	data, err := os.ReadFile(stateFile)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("Failed to read state file: %v", err)
-		}
-		return
-	}
-	if err := json.Unmarshal(data, &registeredContainers); err != nil {
-		log.Printf("Failed to unmarshal state: %v", err)
-	}
+	saveStateToEtcd()
 }
 
 func findContainerByName(cli *client.Client, ctx context.Context, name string) (*types.ContainerJSON, error) {
@@ -403,4 +398,73 @@ func findContainerByName(cli *client.Client, ctx context.Context, name string) (
 		}
 	}
 	return nil, fmt.Errorf("container %s not found", name)
+}
+
+func saveStateToEtcd() {
+	mu.Lock()
+	defer mu.Unlock()
+
+	data, err := json.Marshal(registeredCache)
+	if err != nil {
+		log.Printf("Failed to marshal registeredCache: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// ذخیره با نسخه جدید
+	resp, err := etcdClient.Put(ctx, etcdKeyPrefix+containerName, string(data))
+	if err != nil {
+		log.Printf("Failed to put data to etcd: %v", err)
+		return
+	}
+
+	// گرفتن نسخه‌ها و حذف نسخه‌های قدیمی
+	keepRevisions(ctx)
+	log.Printf("Saved state to etcd with revision %d", resp.Header.Revision)
+}
+
+func keepRevisions(ctx context.Context) {
+	// گرفتن همه نسخه‌های کلید
+	resp, err := etcdClient.Get(ctx, etcdKeyPrefix+containerName, clientv3.WithPrefix(), clientv3.WithRev(0))
+	if err != nil {
+		log.Printf("Failed to get revisions from etcd: %v", err)
+		return
+	}
+
+	// فقط نسخه‌های قدیمی‌تر حذف می‌شوند
+	if len(resp.Kvs) <= maxVersionsToKeep {
+		return
+	}
+
+	// حذف نسخه‌های قدیمی‌تر (اگر کلیدهای مختلف داشتیم)
+	// اینجا چون فقط یک کلید هست، نسخه‌های قدیمی با compact پاک می‌شوند
+	// etcd خودش نسخه‌ها را مدیریت می‌کند، ولی اینجا برای مثال کد compact می‌آوریم:
+	compactRev := resp.Header.Revision - int64(maxVersionsToKeep)
+	_, err = etcdClient.Compact(ctx, compactRev)
+	if err != nil {
+		log.Printf("Failed to compact etcd at revision %d: %v", compactRev, err)
+	}
+}
+
+func loadStateFromEtcd() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := etcdClient.Get(ctx, etcdKeyPrefix+containerName)
+	if err != nil {
+		log.Printf("Failed to load state from etcd: %v", err)
+		return
+	}
+	if len(resp.Kvs) == 0 {
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	err = json.Unmarshal(resp.Kvs[0].Value, &registeredCache)
+	if err != nil {
+		log.Printf("Failed to unmarshal registeredCache: %v", err)
+	}
 }

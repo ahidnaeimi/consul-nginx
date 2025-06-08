@@ -1,1 +1,8 @@
-{}
+{
+  "68448b529ca3": {
+    "ports": [
+      8000
+    ],
+    "serviceName": "myapp"
+  }
+}

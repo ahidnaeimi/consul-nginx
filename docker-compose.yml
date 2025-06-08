@@ -41,9 +41,11 @@ services:
     container_name: conship
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./conship/registered.json:/registered.json:rw
     environment:
       - CONSUL_HTTP_ADDR=http://consul:8500
       - CONSUL_HTTP_TOKEN=ca01e2c4-f6c1-d582-6ba3-fc5f63208ded
+      - ETCD_ENDPOINTS=etcd:2379
     networks:
       - mynet
     depends_on:
@@ -104,5 +106,37 @@ services:
       - nginx
       - consul
       # - myapp
+    networks:
+      - mynet
+  
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: etcd
+    # environment:
+    #   - ETCD_NAME=etcd0
+    #   - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://0.0.0.0:2380
+    #   - ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379
+    #   - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+    #   - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+    #   - ETCD_INITIAL_CLUSTER=etcd0=http://0.0.0.0:2380
+    #   - ETCD_INITIAL_CLUSTER_STATE=new
+    #   - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - ./etcd-data:/etcd-data
+    command: >
+      /usr/local/bin/etcd
+      --data-dir=/etcd-data
+      --name etcd0
+      --initial-advertise-peer-urls http://0.0.0.0:2380
+      --listen-peer-urls http://0.0.0.0:2380
+      --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://0.0.0.0:2379
+      --initial-cluster etcd0=http://0.0.0.0:2380
+      --initial-cluster-state new
+      --initial-cluster-token etcd-cluster-1
+
     networks:
       - mynet
