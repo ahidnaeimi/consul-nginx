@@ -267,7 +267,7 @@ func handleContainerStart(cli *client.Client, containerID string) {
 	registeredCache[shortID] = ContainerInfo{Ports: ports, ServiceName: svcName}
 	mu.Unlock()
 
-	saveStateToEtcd()
+	saveStateToEtcd(svcName)
 }
 
 func handleContainerStop(containerID string) {
@@ -378,7 +378,7 @@ func handleContainerStop(containerID string) {
 	delete(registeredCache, shortID)
 	mu.Unlock()
 
-	saveStateToEtcd()
+	saveStateToEtcd(info.ServiceName)
 }
 
 func findContainerByName(cli *client.Client, ctx context.Context, name string) (*types.ContainerJSON, error) {
@@ -400,7 +400,7 @@ func findContainerByName(cli *client.Client, ctx context.Context, name string) (
 	return nil, fmt.Errorf("container %s not found", name)
 }
 
-func saveStateToEtcd() {
+func saveStateToEtcd(serviceName string) {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -414,20 +414,20 @@ func saveStateToEtcd() {
 	defer cancel()
 
 	// ذخیره با نسخه جدید
-	resp, err := etcdClient.Put(ctx, etcdKeyPrefix+containerName, string(data))
+	resp, err := etcdClient.Put(ctx, etcdKeyPrefix+serviceName, string(data))
 	if err != nil {
 		log.Printf("Failed to put data to etcd: %v", err)
 		return
 	}
 
 	// گرفتن نسخه‌ها و حذف نسخه‌های قدیمی
-	keepRevisions(ctx)
+	keepRevisions(ctx, serviceName)
 	log.Printf("Saved state to etcd with revision %d", resp.Header.Revision)
 }
 
-func keepRevisions(ctx context.Context) {
+func keepRevisions(ctx context.Context, serviceName string) {
 	// گرفتن همه نسخه‌های کلید
-	resp, err := etcdClient.Get(ctx, etcdKeyPrefix+containerName, clientv3.WithPrefix(), clientv3.WithRev(0))
+	resp, err := etcdClient.Get(ctx, etcdKeyPrefix+serviceName, clientv3.WithPrefix(), clientv3.WithRev(0))
 	if err != nil {
 		log.Printf("Failed to get revisions from etcd: %v", err)
 		return
