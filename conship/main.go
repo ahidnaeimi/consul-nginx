@@ -309,6 +309,60 @@ func handleContainerStart(cli *client.Client, containerID string) {
 		log.Printf("Number of previous values found: %d", len(oldResp.Kvs))
 		if len(oldResp.Kvs) > 0 {
 			log.Printf("Previous value for key %s: %s", etcdKey, string(oldResp.Kvs[0].Value))
+
+			// خواندن اطلاعات کانتینر قبلی
+			var oldContainerInfo ContainerInfo
+			if err := json.Unmarshal(oldResp.Kvs[0].Value, &oldContainerInfo); err != nil {
+				log.Printf("Failed to unmarshal old container info: %v", err)
+			} else if oldContainerInfo.ContainerID != "" {
+				// حذف کانتینر قبلی
+				containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+				if err != nil {
+					log.Printf("Failed to list containers: %v", err)
+				} else {
+					for _, cntr := range containers {
+						if cntr.ID[:12] == oldContainerInfo.ContainerID {
+							log.Printf("Found old container %s, stopping and removing...", oldContainerInfo.ContainerID)
+
+							// توقف کانتینر
+							timeout := 10
+							err := cli.ContainerStop(ctx, cntr.ID, container.StopOptions{
+								Timeout: &timeout,
+							})
+							if err != nil {
+								log.Printf("Failed to stop old container %s: %v", oldContainerInfo.ContainerID, err)
+							} else {
+								log.Printf("Successfully stopped old container %s", oldContainerInfo.ContainerID)
+							}
+
+							// حذف کانتینر
+							err = cli.ContainerRemove(ctx, cntr.ID, container.RemoveOptions{
+								Force:         true,
+								RemoveVolumes: true,
+								RemoveLinks:   true,
+							})
+							if err != nil {
+								log.Printf("Failed to remove old container %s: %v", oldContainerInfo.ContainerID, err)
+								// تلاش مجدد با حذف link‌ها
+								log.Printf("Trying to remove container %s without links...", oldContainerInfo.ContainerID)
+								err = cli.ContainerRemove(ctx, cntr.ID, container.RemoveOptions{
+									Force:         true,
+									RemoveVolumes: true,
+									RemoveLinks:   false,
+								})
+								if err != nil {
+									log.Printf("Failed to remove old container %s in second attempt: %v", oldContainerInfo.ContainerID, err)
+								} else {
+									log.Printf("Successfully removed old container %s in second attempt", oldContainerInfo.ContainerID)
+								}
+							} else {
+								log.Printf("Successfully removed old container %s", oldContainerInfo.ContainerID)
+							}
+							break
+						}
+					}
+				}
+			}
 		} else {
 			log.Printf("No previous value found for key %s (first time registration)", etcdKey)
 		}
