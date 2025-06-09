@@ -44,6 +44,7 @@ var (
 type ContainerInfo struct {
 	Ports       []int  `json:"ports"`
 	ServiceName string `json:"serviceName"`
+	ContainerID string `json:"containerID"`
 }
 
 func initContainerName() error {
@@ -109,7 +110,6 @@ func main() {
 		select {
 		case event := <-eventsCh:
 			if event.Type == events.ContainerEventType {
-				log.Println("Action: %s", event.Action)
 				switch event.Action {
 				case "start":
 					go handleContainerStart(cli, event.ID)
@@ -257,17 +257,98 @@ func handleContainerStart(cli *client.Client, containerID string) {
 		log.Printf("Service %s on port %d registered", svcName, port)
 	}
 
-	// shortID := containerID[:12]
-	// mu.Lock()
-	// registeredContainers[shortID] = ContainerInfo{Ports: ports, ServiceName: svcName}
-	// mu.Unlock()
-	// saveState()
-	shortID := containerID[:12]
-	mu.Lock()
-	registeredCache[shortID] = ContainerInfo{Ports: ports, ServiceName: svcName}
-	mu.Unlock()
+	// منتظر ماندن تا سرویس healthy شود
+	maxRetries := 30 // 30 بار تلاش با فاصله 2 ثانیه = 60 ثانیه
+	healthy := false
+	for i := 0; i < maxRetries; i++ {
+		// چک کردن سلامت سرویس
+		url := fmt.Sprintf("%s/v1/agent/health/service/name/%s", consulAddress, svcName)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			log.Printf("Failed to create health check request: %v", err)
+			continue
+		}
+		if consulToken != "" {
+			req.Header.Set("X-Consul-Token", consulToken)
+		}
 
-	saveStateToEtcd(svcName)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("Failed to check service health: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Failed to read health check response: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		var health []map[string]interface{}
+		if err := json.Unmarshal(body, &health); err != nil {
+			log.Printf("Failed to parse health check response: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		allHealthy := true
+		for _, check := range health {
+			if status, ok := check["Status"].(string); ok {
+				if status != "passing" {
+					allHealthy = false
+					break
+				}
+			}
+		}
+
+		if allHealthy {
+			healthy = true
+			log.Printf("Service %s is now healthy", svcName)
+			break
+		}
+
+		log.Printf("Waiting for service %s to become healthy... (attempt %d/%d)", svcName, i+1, maxRetries)
+		time.Sleep(2 * time.Second)
+	}
+
+	if !healthy {
+		log.Printf("Service %s did not become healthy after %d seconds", svcName, maxRetries*2)
+		return
+	}
+
+	// حذف اطلاعات قبلی از etcd
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	etcdKey := fmt.Sprintf("%s%s", etcdKeyPrefix, svcName)
+	_, err = etcdClient.Delete(ctx, etcdKey)
+	if err != nil {
+		log.Printf("Failed to delete old container info from etcd: %v", err)
+	} else {
+		log.Printf("Successfully deleted old container info from etcd for service %s", svcName)
+	}
+
+	// ذخیره اطلاعات جدید در etcd
+	containerInfo := ContainerInfo{
+		Ports:       ports,
+		ServiceName: svcName,
+		ContainerID: containerID[:12],
+	}
+	data, err := json.Marshal(containerInfo)
+	if err != nil {
+		log.Printf("Failed to marshal container info: %v", err)
+		return
+	}
+
+	_, err = etcdClient.Put(ctx, etcdKey, string(data))
+	if err != nil {
+		log.Printf("Failed to save container info to etcd: %v", err)
+	} else {
+		log.Printf("Successfully saved container info to etcd for service %s", svcName)
+	}
 }
 
 func handleContainerStop(containerID string) {
