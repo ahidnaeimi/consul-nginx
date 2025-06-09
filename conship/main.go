@@ -505,14 +505,6 @@ func handleContainerStop(containerID string) {
 			log.Printf("Deregistered service %s from catalog (status %d)", serviceID, catalogDeregisterResp.StatusCode)
 		}
 	}
-
-	// حذف اطلاعات از etcd
-	_, err = etcdClient.Delete(context.Background(), etcdKey)
-	if err != nil {
-		log.Printf("Failed to delete container info from etcd: %v", err)
-	} else {
-		log.Printf("Successfully deleted container info from etcd for service %s", serviceName)
-	}
 }
 
 func findContainerByName(cli *client.Client, ctx context.Context, name string) (*types.ContainerJSON, error) {
