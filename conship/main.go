@@ -10,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -30,15 +29,13 @@ func getEnv(key, fallback string) string {
 }
 
 var (
-	consulAddress     = getEnv("CONSUL_HTTP_ADDR", "http://localhost:8500")
-	consulToken       = getEnv("CONSUL_HTTP_TOKEN", "")
-	etcdEndpoints     = strings.Split(getEnv("ETCD_ENDPOINTS", "localhost:2379"), ",")
-	registeredCache   = make(map[string]ContainerInfo)
-	mu                sync.Mutex
+	consulAddress            = getEnv("CONSUL_HTTP_ADDR", "http://consul:8500")
+	consulToken              = getEnv("CONSUL_HTTP_TOKEN", "")
+	etcdEndpoints            = strings.Split(getEnv("ETCD_ENDPOINTS", "localhost:2379"), ",")
 	containerName     string = "conship"
 	etcdClient        *clientv3.Client
-	maxVersionsToKeep = 3
-	etcdKeyPrefix     = "conship/"
+	maxVersionsToKeep int64 = 5
+	etcdKeyPrefix           = "conship/"
 )
 
 type ContainerInfo struct {
@@ -93,8 +90,6 @@ func main() {
 	}
 	fmt.Println("Container Name:", containerName)
 
-	loadStateFromEtcd()
-
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -113,8 +108,12 @@ func main() {
 				switch event.Action {
 				case "start":
 					go handleContainerStart(cli, event.ID)
-				case "die", "destroy":
-					go handleContainerStop(event.ID)
+				case "die":
+					log.Printf("Container %s stopped", event.Actor.ID)
+					handleContainerStop(event.Actor.ID)
+				case "destroy":
+					log.Printf("Container %s destroyed", event.Actor.ID)
+					handleContainerStop(event.Actor.ID)
 				}
 			}
 		case err := <-errCh:
@@ -390,22 +389,36 @@ func handleContainerStart(cli *client.Client, containerID string) {
 }
 
 func handleContainerStop(containerID string) {
-	shortID := containerID[:12]
-
-	// mu.Lock()
-	// info, ok := registeredContainers[shortID]
-	// mu.Unlock()
-	mu.Lock()
-	info, ok := registeredCache[shortID]
-	mu.Unlock()
-
-	if !ok {
-		log.Printf("No registered info found for container %s", shortID)
+	// خواندن اطلاعات از etcd با استفاده از نام سرویس
+	etcdKey := "conship/myapp"
+	oldResp, err := etcdClient.Get(context.Background(), etcdKey)
+	if err != nil {
+		log.Printf("Failed to get container info from etcd: %v", err)
 		return
 	}
 
-	for _, port := range info.Ports {
-		serviceID := fmt.Sprintf("%s-%d", shortID, port)
+	if len(oldResp.Kvs) == 0 {
+		log.Printf("No container info found in etcd for service myapp")
+		return
+	}
+
+	log.Printf("Previous revision for key %s: %d", etcdKey, oldResp.Kvs[0].ModRevision)
+	log.Printf("Previous value for key %s: %s", etcdKey, string(oldResp.Kvs[0].Value))
+
+	var containerInfo ContainerInfo
+	if err := json.Unmarshal(oldResp.Kvs[0].Value, &containerInfo); err != nil {
+		log.Printf("Failed to unmarshal container info: %v", err)
+		return
+	}
+
+	// استفاده از نام سرویس از containerInfo
+	serviceName := containerInfo.ServiceName
+	log.Printf("Processing service: %s", serviceName)
+
+	for _, port := range containerInfo.Ports {
+		// استفاده از containerID برای ساخت serviceID
+		serviceID := fmt.Sprintf("%s-%d", containerInfo.ContainerID, port)
+		log.Printf("Deregistering service with ID: %s", serviceID)
 
 		// حذف از Agent
 		req, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/agent/service/deregister/%s", consulAddress, serviceID), nil)
@@ -425,7 +438,7 @@ func handleContainerStop(containerID string) {
 		}
 
 		// حذف از Catalog
-		catalogURL := fmt.Sprintf("%s/v1/catalog/service/%s", consulAddress, info.ServiceName)
+		catalogURL := fmt.Sprintf("%s/v1/catalog/service/%s", consulAddress, serviceName)
 		catalogReq, err := http.NewRequest("GET", catalogURL, nil)
 		if err != nil {
 			log.Printf("Failed to create catalog lookup request for %s: %v", serviceID, err)
@@ -493,11 +506,13 @@ func handleContainerStop(containerID string) {
 		}
 	}
 
-	mu.Lock()
-	delete(registeredCache, shortID)
-	mu.Unlock()
-
-	saveStateToEtcd(info.ServiceName)
+	// حذف اطلاعات از etcd
+	_, err = etcdClient.Delete(context.Background(), etcdKey)
+	if err != nil {
+		log.Printf("Failed to delete container info from etcd: %v", err)
+	} else {
+		log.Printf("Successfully deleted container info from etcd for service %s", serviceName)
+	}
 }
 
 func findContainerByName(cli *client.Client, ctx context.Context, name string) (*types.ContainerJSON, error) {
@@ -517,73 +532,4 @@ func findContainerByName(cli *client.Client, ctx context.Context, name string) (
 		}
 	}
 	return nil, fmt.Errorf("container %s not found", name)
-}
-
-func saveStateToEtcd(serviceName string) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	data, err := json.Marshal(registeredCache)
-	if err != nil {
-		log.Printf("Failed to marshal registeredCache: %v", err)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// ذخیره با نسخه جدید
-	resp, err := etcdClient.Put(ctx, etcdKeyPrefix+serviceName, string(data))
-	if err != nil {
-		log.Printf("Failed to put data to etcd: %v", err)
-		return
-	}
-
-	// گرفتن نسخه‌ها و حذف نسخه‌های قدیمی
-	keepRevisions(ctx, serviceName)
-	log.Printf("Saved state to etcd with revision %d", resp.Header.Revision)
-}
-
-func keepRevisions(ctx context.Context, serviceName string) {
-	// گرفتن همه نسخه‌های کلید
-	resp, err := etcdClient.Get(ctx, etcdKeyPrefix+serviceName, clientv3.WithPrefix(), clientv3.WithRev(0))
-	if err != nil {
-		log.Printf("Failed to get revisions from etcd: %v", err)
-		return
-	}
-
-	// فقط نسخه‌های قدیمی‌تر حذف می‌شوند
-	if len(resp.Kvs) <= maxVersionsToKeep {
-		return
-	}
-
-	// حذف نسخه‌های قدیمی‌تر (اگر کلیدهای مختلف داشتیم)
-	// اینجا چون فقط یک کلید هست، نسخه‌های قدیمی با compact پاک می‌شوند
-	// etcd خودش نسخه‌ها را مدیریت می‌کند، ولی اینجا برای مثال کد compact می‌آوریم:
-	compactRev := resp.Header.Revision - int64(maxVersionsToKeep)
-	_, err = etcdClient.Compact(ctx, compactRev)
-	if err != nil {
-		log.Printf("Failed to compact etcd at revision %d: %v", compactRev, err)
-	}
-}
-
-func loadStateFromEtcd() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := etcdClient.Get(ctx, etcdKeyPrefix+containerName)
-	if err != nil {
-		log.Printf("Failed to load state from etcd: %v", err)
-		return
-	}
-	if len(resp.Kvs) == 0 {
-		return
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	err = json.Unmarshal(resp.Kvs[0].Value, &registeredCache)
-	if err != nil {
-		log.Printf("Failed to unmarshal registeredCache: %v", err)
-	}
 }
