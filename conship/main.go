@@ -261,53 +261,29 @@ func handleContainerStart(cli *client.Client, containerID string) {
 	maxRetries := 30 // 30 بار تلاش با فاصله 2 ثانیه = 60 ثانیه
 	healthy := false
 	for i := 0; i < maxRetries; i++ {
-		// چک کردن سلامت سرویس
-		url := fmt.Sprintf("%s/v1/agent/health/service/name/%s", consulAddress, svcName)
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			log.Printf("Failed to create health check request: %v", err)
-			continue
-		}
-		if consulToken != "" {
-			req.Header.Set("X-Consul-Token", consulToken)
-		}
-
-		resp, err := http.DefaultClient.Do(req)
+		// بررسی وضعیت سرویس
+		healthURL := fmt.Sprintf("%s/v1/health/service/%s", consulAddress, svcName)
+		resp, err := http.Get(healthURL)
 		if err != nil {
 			log.Printf("Failed to check service health: %v", err)
-			time.Sleep(2 * time.Second)
 			continue
 		}
+		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
 		if err != nil {
 			log.Printf("Failed to read health check response: %v", err)
-			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		var health []map[string]interface{}
-		if err := json.Unmarshal(body, &health); err != nil {
-			log.Printf("Failed to parse health check response: %v", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		allHealthy := true
-		for _, check := range health {
-			if status, ok := check["Status"].(string); ok {
-				if status != "passing" {
-					allHealthy = false
-					break
-				}
-			}
-		}
-
-		if allHealthy {
+		// بررسی وضعیت سرویس
+		if resp.StatusCode == http.StatusOK {
+			// اگر پاسخ OK است، سرویس سالم است
 			healthy = true
-			log.Printf("Service %s is now healthy", svcName)
+			log.Printf("Service %s is healthy", svcName)
 			break
+		} else {
+			log.Printf("Service %s is not healthy. Status: %d, Response: %s", svcName, resp.StatusCode, string(body))
 		}
 
 		log.Printf("Waiting for service %s to become healthy... (attempt %d/%d)", svcName, i+1, maxRetries)
@@ -323,12 +299,19 @@ func handleContainerStart(cli *client.Client, containerID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	etcdKey := fmt.Sprintf("%s%s", etcdKeyPrefix, svcName)
-	_, err = etcdClient.Delete(ctx, etcdKey)
+	etcdKey := fmt.Sprintf("conship/%s", svcName)
+
+	// خواندن مقدار قبلی قبل از درج
+	oldResp, err := etcdClient.Get(ctx, etcdKey)
 	if err != nil {
-		log.Printf("Failed to delete old container info from etcd: %v", err)
+		log.Printf("Failed to get previous value: %v", err)
 	} else {
-		log.Printf("Successfully deleted old container info from etcd for service %s", svcName)
+		log.Printf("Number of previous values found: %d", len(oldResp.Kvs))
+		if len(oldResp.Kvs) > 0 {
+			log.Printf("Previous value for key %s: %s", etcdKey, string(oldResp.Kvs[0].Value))
+		} else {
+			log.Printf("No previous value found for key %s (first time registration)", etcdKey)
+		}
 	}
 
 	// ذخیره اطلاعات جدید در etcd
@@ -337,13 +320,14 @@ func handleContainerStart(cli *client.Client, containerID string) {
 		ServiceName: svcName,
 		ContainerID: containerID[:12],
 	}
-	data, err := json.Marshal(containerInfo)
+	containerInfoJSON, err := json.Marshal(containerInfo)
 	if err != nil {
 		log.Printf("Failed to marshal container info: %v", err)
 		return
 	}
 
-	_, err = etcdClient.Put(ctx, etcdKey, string(data))
+	// درج مقدار جدید
+	_, err = etcdClient.Put(ctx, etcdKey, string(containerInfoJSON))
 	if err != nil {
 		log.Printf("Failed to save container info to etcd: %v", err)
 	} else {
