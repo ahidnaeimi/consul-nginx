@@ -122,9 +122,9 @@ services:
     #   - ETCD_INITIAL_CLUSTER=etcd0=http://0.0.0.0:2380
     #   - ETCD_INITIAL_CLUSTER_STATE=new
     #   - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
-    ports:
-      - "2379:2379"
-      - "2380:2380"
+    # ports:
+      # - "2379:2379"
+      # - "2380:2380"
     volumes:
       - ./etcd-data:/etcd-data
     command: >
