@@ -137,20 +137,23 @@ func handleContainerStart(cli *client.Client, containerID string) {
 		log.Printf("Failed to get container info with containerID %s: %v", containerID, err)
 		return
 	}
-	for portProto := range containerInfo.AllowedPorts {
+	var firstPort int
+	for port := range containerInfo.AllowedPorts {
 		consulRegistered(cli,
 			containerInfo.SvcName,
 			containerID,
 			containerInfo.ServiceAddress,
-			portProto,
+			port,
 			containerInfo.Tags)
+		firstPort = port
 	}
 
 	// منتظر ماندن تا سرویس healthy شود
 	maxRetries := 30 // 30 بار تلاش با فاصله 2 ثانیه = 60 ثانیه
 	healthy := false
 	for i := 0; i < maxRetries && !healthy; i++ {
-		healthy = serviceHealthCheck(containerInfo.SvcName)
+		serviceID := fmt.Sprintf("%s-%d", containerID[:12],firstPort)
+		healthy = serviceHealthCheck(serviceID)
 
 		log.Printf("Waiting for service %s to become healthy... (attempt %d/%d)", containerInfo.SvcName, i+1, maxRetries)
 		time.Sleep(2 * time.Second)

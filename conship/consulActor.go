@@ -110,13 +110,8 @@ func consulDeregistered(serviceName string, serviceID string) {
 	}
 }
 
-func serviceHealthCheck(svcName string) bool {
-	// منتظر ماندن تا سرویس healthy شود
-	// maxRetries := 30 // 30 بار تلاش با فاصله 2 ثانیه = 60 ثانیه
-	// healthy := false
-	// for i := 0; i < maxRetries; i++ {
-	// چک کردن سلامت سرویس
-	url := fmt.Sprintf("%s/v1/agent/health/service/name/%s", consulAddress, svcName)
+func serviceHealthCheck(serviceID string) bool {
+	url := fmt.Sprintf("%s/v1/agent/health/service/id/%s?format=text", consulAddress, serviceID)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		log.Printf("Failed to create health check request: %v", err)
@@ -141,30 +136,12 @@ func serviceHealthCheck(svcName string) bool {
 		return false
 	}
 
-	var health []map[string]interface{}
-	if err := json.Unmarshal(body, &health); err != nil {
-		log.Printf("Failed to parse health check response: %v", err)
-		time.Sleep(2 * time.Second)
-		return false
-	}
-
-	allHealthy := true
-	for _, check := range health {
-		if status, ok := check["Status"].(string); ok {
-			if status != "passing" {
-				allHealthy = false
-				break
-			}
-		}
-	}
-
-	if allHealthy {
-		log.Printf("Service %s is now healthy", svcName)
+	status := strings.TrimSpace(string(body))
+	if status == "passing" {
+		log.Printf("✅ Instance %s is healthy", serviceID)
 		return true
 	}
-	return false
-	// 	log.Printf("Waiting for service %s to become healthy... (attempt %d/%d)", svcName, i+1, maxRetries)
-	// 	time.Sleep(2 * time.Second)
-	// }
 
+	log.Printf("⚠️ Instance %s status: %s", serviceID, status)
+	return false
 }
