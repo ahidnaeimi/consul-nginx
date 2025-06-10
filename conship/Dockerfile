@@ -10,7 +10,10 @@ COPY go.mod go.sum ./
 # RUN go mod download
 
 COPY main.go ./
-RUN CGO_ENABLED=0 go build -o conship main.go
+COPY consulActor.go ./
+COPY etcdActor.go ./
+COPY dockerActor.go ./
+RUN CGO_ENABLED=0 go build -o conship main.go consulActor.go etcdActor.go dockerActor.go
 
 FROM docker.repoifb.local/debian:buster-slim
 

@@ -2,13 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,7 +14,6 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
-	"github.com/docker/go-connections/nat"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -35,13 +31,21 @@ var (
 	containerName     string = "conship"
 	etcdClient        *clientv3.Client
 	maxVersionsToKeep int64 = 5
-	etcdKeyPrefix           = "conship/"
 )
 
 type ContainerInfo struct {
 	Ports       []int  `json:"ports"`
 	ServiceName string `json:"serviceName"`
 	ContainerID string `json:"containerID"`
+}
+
+type ServiceInfo struct {
+	SvcName        string       `json:"SvcName"`
+	ContainerName  string       `json:"ContainerName"`
+	ContainerID    string       `json:"ContainerID"`
+	ServiceAddress string       `json:"ServiceAddress"`
+	AllowedPorts   map[int]bool `json:"AllowedPorts"`
+	Tags           []string     `json:"Tags"`
 }
 
 func initContainerName() error {
@@ -61,6 +65,8 @@ func initContainerName() error {
 	if err != nil {
 		return err
 	}
+	etcd := &Etcd{ctx: context.Background()}
+	go etcd.watchKeyHistory()
 
 	for _, container := range containers {
 		if strings.HasPrefix(container.ID, idPrefix) {
@@ -107,13 +113,12 @@ func main() {
 			if event.Type == events.ContainerEventType {
 				switch event.Action {
 				case "start":
-					go handleContainerStart(cli, event.ID)
+					go handleContainerStart(cli, event.Actor.ID)
 				case "die":
 					log.Printf("Container %s stopped", event.Actor.ID)
-					handleContainerStop(event.Actor.ID)
+					handleContainerStop(cli, event.Actor.ID)
 				case "destroy":
 					log.Printf("Container %s destroyed", event.Actor.ID)
-					handleContainerStop(event.Actor.ID)
 				}
 			}
 		case err := <-errCh:
@@ -126,384 +131,58 @@ func main() {
 }
 
 func handleContainerStart(cli *client.Client, containerID string) {
-	ctx := context.Background()
 
-	jsonData, err := cli.ContainerInspect(ctx, containerID)
+	containerInfo, err := getContainerInfo(cli, containerID)
 	if err != nil {
-		log.Printf("Failed to inspect container %s: %v", containerID, err)
+		log.Printf("Failed to get container info with containerID %s: %v", containerID, err)
 		return
 	}
-
-	// فقط اگر لیبل SERVICE_NAME وجود دارد، ثبت شود
-	svcName, ok := jsonData.Config.Labels["SERVICE_NAME"]
-	if !ok || svcName == "" {
-		log.Printf("SERVICE_NAME label missing for container %s", containerID[:12])
-		return
-	}
-
-	conshipContainer, err := findContainerByName(cli, ctx, containerName)
-	if err != nil {
-		log.Printf("Failed to find conship container: %v", err)
-		return
-	}
-
-	conshipIP := ""
-	for _, net := range conshipContainer.NetworkSettings.Networks {
-		if net.IPAddress != "" {
-			conshipIP = net.IPAddress
-			break
-		}
-	}
-	if conshipIP == "" {
-		log.Println("Conship container has no IP")
-		return
-	}
-
-	sharedNet := ""
-	for name, net := range jsonData.NetworkSettings.Networks {
-		for _, cnet := range conshipContainer.NetworkSettings.Networks {
-			if net.NetworkID == cnet.NetworkID {
-				sharedNet = name
-				break
-			}
-		}
-		if sharedNet != "" {
-			break
-		}
-	}
-	if sharedNet == "" {
-		log.Printf("Container %s is not on the same network as conship", jsonData.Name)
-		return
-	}
-
-	containerName := strings.TrimPrefix(jsonData.Name, "/")
-	serviceAddress := jsonData.NetworkSettings.Networks[sharedNet].IPAddress
-
-	var ports []int
-	var allowedPorts map[int]bool
-
-	portsLabel, ok := jsonData.Config.Labels["SERVICE_PORTS"]
-	if ok && portsLabel != "" {
-		allowedPorts = make(map[int]bool)
-		for _, part := range strings.Split(portsLabel, ",") {
-			p, err := strconv.Atoi(strings.TrimSpace(part))
-			if err != nil {
-				log.Printf("Invalid port in SERVICE_PORTS label: %v", err)
-				continue
-			}
-			allowedPorts[p] = true
-		}
-	}
-
-	for portProto := range jsonData.NetworkSettings.Ports {
-		port, err := nat.ParsePort(portProto.Port())
-		if err != nil {
-			log.Printf("Invalid port %s for container %s: %v", portProto.Port(), containerName, err)
-			continue
-		}
-		if allowedPorts != nil && !allowedPorts[port] {
-			continue
-		}
-
-		bindings := jsonData.NetworkSettings.Ports[portProto]
-		tags := []string{"docker"}
-		if len(bindings) > 0 {
-			tags = append(tags, "bound")
-		} else {
-			tags = append(tags, "exposed-only")
-		}
-
-		envTags := ""
-		for _, env := range jsonData.Config.Env {
-			if strings.HasPrefix(env, "SERVICE_TAGS=") {
-				envTags = strings.TrimPrefix(env, "SERVICE_TAGS=")
-				break
-			}
-		}
-		if envTags != "" {
-			for _, tag := range strings.Split(envTags, ",") {
-				if trimmed := strings.TrimSpace(tag); trimmed != "" {
-					tags = append(tags, trimmed)
-				}
-			}
-		}
-
-		serviceID := fmt.Sprintf("%s-%d", containerID[:12], port)
-		serviceDef := map[string]interface{}{
-			"ID":      serviceID,
-			"Name":    svcName,
-			"Address": serviceAddress,
-			"Port":    port,
-			"Tags":    tags,
-			"Check": map[string]interface{}{
-				"TCP":                            fmt.Sprintf("%s:%d", serviceAddress, port),
-				"Interval":                       "10s",
-				"Timeout":                        "1s",
-				"DeregisterCriticalServiceAfter": "1m",
-			},
-		}
-		payload, _ := json.Marshal(serviceDef)
-		req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/v1/agent/service/register", consulAddress), strings.NewReader(string(payload)))
-		if consulToken != "" {
-			req.Header.Set("X-Consul-Token", consulToken)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
-		ports = append(ports, port)
-		log.Printf("Service %s on port %d registered", svcName, port)
+	for portProto := range containerInfo.AllowedPorts {
+		consulRegistered(cli,
+			containerInfo.SvcName,
+			containerID,
+			containerInfo.ServiceAddress,
+			portProto,
+			containerInfo.Tags)
 	}
 
 	// منتظر ماندن تا سرویس healthy شود
 	maxRetries := 30 // 30 بار تلاش با فاصله 2 ثانیه = 60 ثانیه
 	healthy := false
-	for i := 0; i < maxRetries; i++ {
-		// بررسی وضعیت سرویس
-		healthURL := fmt.Sprintf("%s/v1/health/service/%s", consulAddress, svcName)
-		resp, err := http.Get(healthURL)
-		if err != nil {
-			log.Printf("Failed to check service health: %v", err)
-			continue
-		}
-		defer resp.Body.Close()
+	for i := 0; i < maxRetries && !healthy; i++ {
+		healthy = serviceHealthCheck(containerInfo.SvcName)
 
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Failed to read health check response: %v", err)
-			continue
-		}
-
-		// بررسی وضعیت سرویس
-		if resp.StatusCode == http.StatusOK {
-			// اگر پاسخ OK است، سرویس سالم است
-			healthy = true
-			log.Printf("Service %s is healthy", svcName)
-			break
-		} else {
-			log.Printf("Service %s is not healthy. Status: %d, Response: %s", svcName, resp.StatusCode, string(body))
-		}
-
-		log.Printf("Waiting for service %s to become healthy... (attempt %d/%d)", svcName, i+1, maxRetries)
+		log.Printf("Waiting for service %s to become healthy... (attempt %d/%d)", containerInfo.SvcName, i+1, maxRetries)
 		time.Sleep(2 * time.Second)
 	}
 
 	if !healthy {
-		log.Printf("Service %s did not become healthy after %d seconds", svcName, maxRetries*2)
+		log.Printf("Service %s did not become healthy after %d seconds", containerInfo.SvcName, maxRetries*2)
 		return
-	}
-
-	// حذف اطلاعات قبلی از etcd
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	etcdKey := fmt.Sprintf("conship/%s", svcName)
-
-	// خواندن مقدار قبلی قبل از درج
-	oldResp, err := etcdClient.Get(ctx, etcdKey)
-	if err != nil {
-		log.Printf("Failed to get previous value: %v", err)
 	} else {
-		log.Printf("Number of previous values found: %d", len(oldResp.Kvs))
-		if len(oldResp.Kvs) > 0 {
-			log.Printf("Previous value for key %s: %s", etcdKey, string(oldResp.Kvs[0].Value))
-
-			// خواندن اطلاعات کانتینر قبلی
-			var oldContainerInfo ContainerInfo
-			if err := json.Unmarshal(oldResp.Kvs[0].Value, &oldContainerInfo); err != nil {
-				log.Printf("Failed to unmarshal old container info: %v", err)
-			} else if oldContainerInfo.ContainerID != "" {
-				// حذف کانتینر قبلی
-				containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
-				if err != nil {
-					log.Printf("Failed to list containers: %v", err)
-				} else {
-					for _, cntr := range containers {
-						if cntr.ID[:12] == oldContainerInfo.ContainerID {
-							log.Printf("Found old container %s, stopping and removing...", oldContainerInfo.ContainerID)
-
-							// توقف کانتینر
-							timeout := 10
-							err := cli.ContainerStop(ctx, cntr.ID, container.StopOptions{
-								Timeout: &timeout,
-							})
-							if err != nil {
-								log.Printf("Failed to stop old container %s: %v", oldContainerInfo.ContainerID, err)
-							} else {
-								log.Printf("Successfully stopped old container %s", oldContainerInfo.ContainerID)
-							}
-
-							// حذف کانتینر
-							err = cli.ContainerRemove(ctx, cntr.ID, container.RemoveOptions{
-								Force:         true,
-								RemoveVolumes: true,
-								RemoveLinks:   true,
-							})
-							if err != nil {
-								log.Printf("Failed to remove old container %s: %v", oldContainerInfo.ContainerID, err)
-								// تلاش مجدد با حذف link‌ها
-								log.Printf("Trying to remove container %s without links...", oldContainerInfo.ContainerID)
-								err = cli.ContainerRemove(ctx, cntr.ID, container.RemoveOptions{
-									Force:         true,
-									RemoveVolumes: true,
-									RemoveLinks:   false,
-								})
-								if err != nil {
-									log.Printf("Failed to remove old container %s in second attempt: %v", oldContainerInfo.ContainerID, err)
-								} else {
-									log.Printf("Successfully removed old container %s in second attempt", oldContainerInfo.ContainerID)
-								}
-							} else {
-								log.Printf("Successfully removed old container %s", oldContainerInfo.ContainerID)
-							}
-							break
-						}
-					}
-				}
-			}
-		} else {
-			log.Printf("No previous value found for key %s (first time registration)", etcdKey)
-		}
+		log.Printf("Service %s is now healthy", containerInfo.SvcName)
 	}
+	etcd := &Etcd{ctx: context.Background()}
 
-	// ذخیره اطلاعات جدید در etcd
-	containerInfo := ContainerInfo{
-		Ports:       ports,
-		ServiceName: svcName,
-		ContainerID: containerID[:12],
-	}
-	containerInfoJSON, err := json.Marshal(containerInfo)
+	etcd.Add(containerInfo)
+	prevContainerInfo, err := etcd.GetPrev(containerInfo.SvcName)
 	if err != nil {
-		log.Printf("Failed to marshal container info: %v", err)
-		return
-	}
-
-	// درج مقدار جدید
-	_, err = etcdClient.Put(ctx, etcdKey, string(containerInfoJSON))
-	if err != nil {
-		log.Printf("Failed to save container info to etcd: %v", err)
+		log.Println(err)
 	} else {
-		log.Printf("Successfully saved container info to etcd for service %s", svcName)
+		log.Println("Delete Previous Container")
+		removeContainer(cli, prevContainerInfo)
 	}
 }
 
-func handleContainerStop(containerID string) {
-	// خواندن اطلاعات از etcd با استفاده از نام سرویس
-	etcdKey := "conship/myapp"
-	oldResp, err := etcdClient.Get(context.Background(), etcdKey)
+func handleContainerStop(cli *client.Client, containerID string) {
+	containerInfo, err := getContainerInfo(cli, containerID)
 	if err != nil {
-		log.Printf("Failed to get container info from etcd: %v", err)
+		log.Printf("Failed to get container info with containerID %s: %v", containerID, err)
 		return
 	}
-
-	if len(oldResp.Kvs) == 0 {
-		log.Printf("No container info found in etcd for service myapp")
-		return
-	}
-
-	log.Printf("Previous revision for key %s: %d", etcdKey, oldResp.Kvs[0].ModRevision)
-	log.Printf("Previous value for key %s: %s", etcdKey, string(oldResp.Kvs[0].Value))
-
-	var containerInfo ContainerInfo
-	if err := json.Unmarshal(oldResp.Kvs[0].Value, &containerInfo); err != nil {
-		log.Printf("Failed to unmarshal container info: %v", err)
-		return
-	}
-
-	// استفاده از نام سرویس از containerInfo
-	serviceName := containerInfo.ServiceName
-	log.Printf("Processing service: %s", serviceName)
-
-	for _, port := range containerInfo.Ports {
-		// استفاده از containerID برای ساخت serviceID
-		serviceID := fmt.Sprintf("%s-%d", containerInfo.ContainerID, port)
-		log.Printf("Deregistering service with ID: %s", serviceID)
-
-		// حذف از Agent
-		req, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/agent/service/deregister/%s", consulAddress, serviceID), nil)
-		if err != nil {
-			log.Printf("Failed to create agent deregister request for %s: %v", serviceID, err)
-			continue
-		}
-		if consulToken != "" {
-			req.Header.Set("X-Consul-Token", consulToken)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("Failed to deregister %s from agent: %v", serviceID, err)
-		} else {
-			resp.Body.Close()
-			log.Printf("Deregistered service %s from agent (status %d)", serviceID, resp.StatusCode)
-		}
-
-		// حذف از Catalog
-		catalogURL := fmt.Sprintf("%s/v1/catalog/service/%s", consulAddress, serviceName)
-		catalogReq, err := http.NewRequest("GET", catalogURL, nil)
-		if err != nil {
-			log.Printf("Failed to create catalog lookup request for %s: %v", serviceID, err)
-			continue
-		}
-		if consulToken != "" {
-			catalogReq.Header.Set("X-Consul-Token", consulToken)
-		}
-		catalogResp, err := http.DefaultClient.Do(catalogReq)
-		if err != nil {
-			log.Printf("Failed to lookup service %s in catalog: %v", serviceID, err)
-			continue
-		}
-
-		bodyBytes, _ := io.ReadAll(catalogResp.Body)
-		catalogResp.Body.Close()
-
-		if catalogResp.StatusCode != http.StatusOK {
-			log.Printf("Service %s not found in catalog (status %d)", serviceID, catalogResp.StatusCode)
-			continue
-		}
-
-		var catalogEntries []struct {
-			Node       string `json:"Node"`
-			Datacenter string `json:"Datacenter"`
-			ServiceID  string `json:"ServiceID"`
-		}
-		if err := json.Unmarshal(bodyBytes, &catalogEntries); err != nil {
-			log.Printf("Failed to decode catalog response for %s: %v", serviceID, err)
-			continue
-		}
-
-		for _, entry := range catalogEntries {
-			if entry.ServiceID != serviceID {
-				continue // فقط سرویسی که مربوط به همین کانتینره حذف شه
-			}
-			deregisterPayload := map[string]string{
-				"Node":       entry.Node,
-				"Datacenter": entry.Datacenter,
-				"ServiceID":  entry.ServiceID,
-			}
-			payloadBytes, err := json.Marshal(deregisterPayload)
-			if err != nil {
-				log.Printf("Failed to marshal catalog deregister payload for %s: %v", serviceID, err)
-				continue
-			}
-
-			catalogDeregisterReq, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/catalog/deregister", consulAddress), strings.NewReader(string(payloadBytes)))
-			if err != nil {
-				log.Printf("Failed to create catalog deregister request for %s: %v", serviceID, err)
-				continue
-			}
-			if consulToken != "" {
-				catalogDeregisterReq.Header.Set("X-Consul-Token", consulToken)
-			}
-			catalogDeregisterReq.Header.Set("Content-Type", "application/json")
-
-			catalogDeregisterResp, err := http.DefaultClient.Do(catalogDeregisterReq)
-			if err != nil {
-				log.Printf("Failed to deregister %s from catalog: %v", serviceID, err)
-				continue
-			}
-			catalogDeregisterResp.Body.Close()
-			log.Printf("Deregistered service %s from catalog (status %d)", serviceID, catalogDeregisterResp.StatusCode)
-		}
+	log.Printf("Die Container Name: %s", containerInfo.ContainerName)
+	for port, _ := range containerInfo.AllowedPorts {
+		consulDeregistered(containerInfo.SvcName, fmt.Sprintf("%s-%d", containerID[:12], port))
 	}
 }
 
