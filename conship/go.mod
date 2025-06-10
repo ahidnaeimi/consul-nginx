@@ -2,14 +2,12 @@ module conship
 
 go 1.24.3
 
-require (
-	github.com/docker/docker v28.1.1+incompatible
-	github.com/docker/go-connections v0.5.0
-)
+require github.com/docker/docker v28.1.1+incompatible
 
 require (
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
+	github.com/docker/go-connections v0.5.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.3 // indirect
 	go.etcd.io/etcd/api/v3 v3.6.1 // indirect
